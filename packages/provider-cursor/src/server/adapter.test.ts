@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, describe, it } from "@effect/vitest";
 import type { InteractionUpdate } from "@cursor/sdk";
 import {
@@ -26,6 +27,8 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
+  cursorCheckpointStateRoot,
+  cursorDefaultCheckpointDatabase,
   cursorMcpServers,
   cursorRuntimeAgentPolicy,
   makeCursorAgentOptions,
@@ -1774,6 +1777,105 @@ describe("CursorAdapterV2", () => {
     assert.notInclude(logged, "secret-cursor-api-key");
     assert.notInclude(logged, "secret-cursor-mcp-token");
   });
+
+  it("keeps Cursor checkpoint files under the Windows path limit", () => {
+    const win32Join = (...segments: string[]) => segments.join("\\");
+    const home = "C:\\Users\\ada";
+    const stateRoot = cursorCheckpointStateRoot(home, win32Join);
+    const database = win32Join(stateRoot, "agents", `agent-${"a".repeat(64)}`, "store.db");
+    assert.isBelow(database.length, 252);
+    assert.isBelow(`${database}-journal`.length, 260);
+    assert.isBelow(cursorDefaultCheckpointDatabase(home, "D:\\src\\app", win32Join).length, 252);
+    assert.isAtLeast(
+      cursorDefaultCheckpointDatabase(home, `D:\\${"workspace\\".repeat(30)}t3code`, win32Join)
+        .length,
+      252,
+    );
+  });
+
+  it.effect("opens Cursor turns against a short checkpoint store", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "cursor-v2-checkpoint-",
+      });
+      const instanceId = ProviderInstanceId.make("cursor");
+      const threadId = ThreadId.make("cursor-checkpoint-thread");
+      const modelSelection = { instanceId, model: "composer-2.5" };
+      const longWorkspace = `D:\\${"workspace\\".repeat(30)}t3code`;
+      const longPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: longWorkspace,
+      });
+      const shortPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: "D:\\src\\app",
+      });
+      let storeRoot: string | undefined;
+      const runner = {
+        assertComplete: Effect.void,
+        open: (input: { readonly options: { readonly local?: { readonly store?: unknown } } }) => {
+          const store = input.options.local?.store;
+          storeRoot =
+            store !== undefined &&
+            typeof store === "object" &&
+            store !== null &&
+            "stateRoot" in store
+              ? String(store.stateRoot)
+              : undefined;
+          return Effect.succeed({
+            agentId: "native-cursor-checkpoint",
+            listMessages: Effect.succeed([]),
+            close: Effect.void,
+            send: () => Effect.die("Cursor checkpoint test does not send"),
+          });
+        },
+      } satisfies CursorAgentSdk.CursorAgentSdkRunner["Service"];
+      const adapter = yield* makeCursorAdapterV2({
+        instanceId,
+        environment: { HOME: workspace },
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, runner),
+        Effect.provide(TestProviderHost.layer({ cwd: workspace })),
+      );
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("cursor-checkpoint-session"),
+        modelSelection,
+        runtimePolicy: longPolicy,
+      });
+      yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy: longPolicy,
+      });
+      assert.equal(storeRoot, cursorCheckpointStateRoot(workspace, path.join));
+      assert.isTrue(yield* fileSystem.exists(storeRoot ?? ""));
+
+      storeRoot = "unchanged";
+      const shortRuntime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("cursor-checkpoint-short-session"),
+        modelSelection,
+        runtimePolicy: shortPolicy,
+      });
+      yield* shortRuntime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy: shortPolicy,
+      });
+      assert.isUndefined(storeRoot);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+      ),
+    ),
+  );
 
   it("recognizes direct and SDK-wrapped abort failures as cancellation", () => {
     assert.isTrue(CursorAgentSdk.isCursorCancellationError({ name: "AbortError" }));
