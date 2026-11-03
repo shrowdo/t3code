@@ -68,7 +68,7 @@ import {
   subagentThreadTitle,
 } from "@t3tools/provider-core/server/subagentProjection";
 import * as CursorAgentSdk from "./CursorAgentSdk.ts";
-import { isCursorSdkError } from "./sdk.ts";
+import { isCursorSdkError, loadCursorSqlite } from "./sdk.ts";
 export { cursorSdkModelSelection } from "./sdkModel.ts";
 
 const CURSOR_DRIVER_KIND = CursorAgentSdk.CURSOR_PROVIDER;
@@ -293,6 +293,39 @@ const CURSOR_AGENT_SETTING_SOURCES = [
   "plugins",
 ] as const satisfies ReadonlyArray<SettingSource>;
 
+// Checkpoint files are `<root>/agents/agent-<sha256>/store.db`. The SDK default root
+// embeds the workspace path and exceeds Windows MAX_PATH, so retries replay the turn.
+const CURSOR_CHECKPOINT_DIGEST = "f".repeat(64);
+
+export function cursorCheckpointStateRoot(
+  homeDirectory: string,
+  join: (...segments: string[]) => string,
+): string {
+  return join(homeDirectory, ".t3", "cursor-agent-store");
+}
+
+export function cursorDefaultCheckpointDatabase(
+  homeDirectory: string,
+  workspaceRef: string,
+  join: (...segments: string[]) => string,
+): string {
+  const slug = workspaceRef
+    .replace(/[^a-zA-Z0-9]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return join(
+    homeDirectory,
+    ".cursor",
+    "projects",
+    slug,
+    "sdk-agent-store",
+    CURSOR_CHECKPOINT_DIGEST,
+    "agents",
+    `agent-${CURSOR_CHECKPOINT_DIGEST}`,
+    "store.db",
+  );
+}
+
 export function makeCursorAgentOptions(input: {
   readonly apiKey?: string;
   readonly modelSelection: ModelSelection;
@@ -300,6 +333,7 @@ export function makeCursorAgentOptions(input: {
   readonly threadId: ThreadId;
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly platform: NodeJS.Platform;
+  readonly store?: NonNullable<AgentOptions["local"]>["store"];
 }): AgentOptions {
   const policy = cursorRuntimeAgentPolicy(input.runtimePolicy, input.platform);
   const mcpServers = cursorMcpServers(input.mcpSession);
@@ -316,6 +350,7 @@ export function makeCursorAgentOptions(input: {
         enabled: policy.sandboxEnabled,
       },
       enableAgentRetries: true,
+      ...(input.store === undefined ? {} : { store: input.store }),
     },
     ...(mcpServers === undefined ? {} : { mcpServers }),
   };
@@ -996,6 +1031,45 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
         const warnedUnsupportedSandbox = yield* Ref.make(false);
         const activeTurn = yield* Ref.make<ActiveCursorTurn | null>(null);
         const planIds = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact["id"]>());
+        const homeDirectory =
+          adapterOptions.environment.HOME?.trim() ||
+          adapterOptions.environment.USERPROFILE?.trim() ||
+          (yield* HostProcess.HomeDirectory);
+        const workspaceRef = input.runtimePolicy.cwd ?? homeDirectory;
+        const defaultCheckpointDatabase = cursorDefaultCheckpointDatabase(
+          homeDirectory,
+          workspaceRef,
+          path.join,
+        );
+        // 252 is the store.db length at which the SQLite journal path reaches MAX_PATH.
+        const checkpointStore =
+          platform === "win32" && defaultCheckpointDatabase.length >= 252
+            ? yield* Effect.tryPromise({
+                try: () =>
+                  loadCursorSqlite().SqliteLocalAgentStore.open({
+                    workspaceRef,
+                    stateRoot: cursorCheckpointStateRoot(homeDirectory, path.join),
+                  }),
+                catch: (cause) =>
+                  new ProviderAdapter.ProviderAdapterOpenSessionError({
+                    driver: CursorAgentSdk.CURSOR_PROVIDER,
+                    providerSessionId: input.providerSessionId,
+                    cause,
+                  }),
+              })
+            : undefined;
+        if (checkpointStore !== undefined) {
+          yield* Effect.addFinalizer(() =>
+            Effect.tryPromise(() => checkpointStore.dispose()).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.cursor-checkpoint-store-dispose-failed", {
+                  providerSessionId: input.providerSessionId,
+                  cause,
+                }),
+              ),
+            ),
+          );
+        }
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
@@ -2238,6 +2312,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             platform,
             threadId: openInput.threadId,
             mcpSession: yield* mcpSessions.read(openInput.threadId),
+            ...(checkpointStore === undefined ? {} : { store: checkpointStore }),
           });
           if (
             platform === "win32" &&
